@@ -1,9 +1,13 @@
+const crypto = require('crypto');
 require('dotenv').config();
 const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
+const axios = require('axios');
 
 // 環境変数の取得
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20240620-v1:0";
 const BEDROCK_MAX_TOKENS = parseInt(process.env.BEDROCK_MAX_TOKENS || "1000", 10);
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
 // Bedrock clientの設定
 const bedrockClient = new BedrockRuntimeClient({ 
@@ -12,23 +16,41 @@ const bedrockClient = new BedrockRuntimeClient({
 
 const handler = async (event) => {
   try {
-    console.log("Received event:", JSON.stringify(event, null, 2));
-    
-    let userInput;
-    if (typeof event.body === 'string') {
-      userInput = JSON.parse(event.body).query;
-    } else if (typeof event.body === 'object') {
-      userInput = event.body.query;
-    } else {
-      userInput = event.query; // API Gateway経由の場合
-    }
-    console.log("ユーザーの入力:", userInput);
-    if (!userInput) {
-      throw new Error("ユーザーの入力を取得できませんでした。");
+    console.log("eventの情報: ", JSON.stringify(event, null, 2));
+
+     // Line signatureの検証
+     const signature = event.headers['x-line-signature'];
+     if (!verifySignature(event.body, LINE_CHANNEL_SECRET, signature)) {
+       return { statusCode: 403, body: 'Invalid signature' };
+     }
+
+     const body = event.body;
+     const lineBody = JSON.parse(body);
+     console.log("LINEのユーザーのメッセージ: ", JSON.stringify(lineBody, null, 2));
+
+     if (!lineBody.events || !Array.isArray(lineBody.events) || lineBody.events.length === 0) {
+      console.log("イベントが空です。これは正常な動作の可能性があります。");
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ message: "イベントが空です。処理をスキップします。" }),
+      };
     }
 
-    const response = await sendToBedrock(userInput);
-    console.log("AIの回答結果:", response);
+    await Promise.all(lineBody.events.map(async (lineEvent) => {
+      console.log("Processing event:", JSON.stringify(lineEvent, null, 2));
+      if (lineEvent.type === 'message' && lineEvent.message.type === 'text') {
+        const userInput = lineEvent.message.text;
+        console.log("ユーザーの入力:", userInput);
+
+        const response = await sendToBedrock(userInput);
+        console.log("AIの回答結果:", response);
+
+        // LINEのユーザーに返信
+        await replyToLine(lineEvent.replyToken, response);
+      } else {
+        console.log("処理対象外のイベントタイプです:", lineEvent.type);
+      }
+    }));
 
     return {
       statusCode: 200,
@@ -66,42 +88,42 @@ async function sendToBedrock(userInput) {
   }
 }
 
-module.exports = { handler };
+async function replyToLine(replyToken, message) {
+  const LINE_MESSAGING_API = 'https://api.line.me/v2/bot/message/reply';
 
-// ローカルテスト用
-if (require.main === module) {
-  const crypto = require('crypto');
-  
-  // 実際のチャネルシークレットを使用（環境変数から読み込むか、直接指定）
-  const channelSecret = process.env.LINE_CHANNEL_SECRET || 'your_channel_secret_here';
-
-  const eventBody = JSON.stringify({
-    events: [{
-      type: 'message',
-      message: {
+  const data = {
+    replyToken: replyToken,
+    messages: [
+      {
         type: 'text',
-        text: 'こんにちは'
-      },
-      replyToken: 'dummy_reply_token'
-    }]
-  });
-
-  // 正しいシグネチャを生成
-  const signature = crypto
-    .createHmac('SHA256', channelSecret)
-    .update(eventBody)
-    .digest('base64');
-
-  const testEvent = {
-    headers: {
-      'x-line-signature': signature
-    },
-    body: eventBody
+        text: message
+      }
+    ]
   };
 
-  handler(testEvent)
-    .then(result => console.log('Result:', result))
-    .catch(error => console.error('Error:', error));
+  try {
+    const response = await axios.post(LINE_MESSAGING_API, data, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
+
+    console.log('AIによる、ユーザーへの返答: ', response.data);
+    return response.data;
+  } catch (error) {
+    console.error('Error sending message to LINE:', error.response ? error.response.data : error.message);
+    throw error;
+  }
 }
+
+function verifySignature(body, channelSecret, signature) {
+  const hash = crypto
+    .createHmac('SHA256', channelSecret)
+    .update(body)
+    .digest('base64');
+  return hash === signature;
+}
+
 
 module.exports = { handler };
