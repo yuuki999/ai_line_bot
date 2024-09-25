@@ -2,12 +2,27 @@ const crypto = require('crypto');
 require('dotenv').config();
 const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
 const axios = require('axios');
+const { google } = require('googleapis');
 
 // 環境変数の取得
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20240620-v1:0";
 const BEDROCK_MAX_TOKENS = parseInt(process.env.BEDROCK_MAX_TOKENS || "1000", 10);
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+
+// Google Sheets API設定
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+
+const auth = new google.auth.JWT(
+  GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  null,
+  GOOGLE_PRIVATE_KEY,
+  ['https://www.googleapis.com/auth/spreadsheets']
+);
+
+const sheets = google.sheets({ version: 'v4', auth });
 
 // Bedrock clientの設定
 const bedrockClient = new BedrockRuntimeClient({ 
@@ -47,6 +62,9 @@ const handler = async (event) => {
 
         // LINEのユーザーに返信
         await replyToLine(lineEvent.replyToken, response);
+
+        // Q&Aをスプレッドシートに記録
+        await recordToSpreadsheet(userInput, response);
       } else {
         console.log("処理対象外のイベントタイプです:", lineEvent.type);
       }
@@ -114,6 +132,24 @@ async function replyToLine(replyToken, message) {
   } catch (error) {
     console.error('Error sending message to LINE:', error.response ? error.response.data : error.message);
     throw error;
+  }
+}
+
+async function recordToSpreadsheet(question, answer) {
+  try {
+    const date = new Date().toISOString();
+    const values = [[date, question, answer]];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'シート1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values },
+    });
+
+    console.log('記録をスプレッドシートに追加しました');
+  } catch (error) {
+    console.error('スプレッドシートへの記録中にエラーが発生しました:', error);
   }
 }
 
