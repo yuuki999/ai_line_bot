@@ -3,6 +3,7 @@ require('dotenv').config();
 const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
 const axios = require('axios');
 const { google } = require('googleapis');
+const line = require('@line/bot-sdk');
 
 // 環境変数の取得
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20240620-v1:0";
@@ -23,6 +24,14 @@ const auth = new google.auth.JWT(
 );
 
 const sheets = google.sheets({ version: 'v4', auth });
+
+// LINEクライアントの設定
+const lineConfig = {
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET
+};
+
+const lineClient = new line.Client(lineConfig);
 
 // Bedrock clientの設定
 const bedrockClient = new BedrockRuntimeClient({ 
@@ -52,7 +61,6 @@ const handler = async (event) => {
     }
 
     await Promise.all(lineBody.events.map(async (lineEvent) => {
-      console.log("Processing event:", JSON.stringify(lineEvent, null, 2));
       if (lineEvent.type === 'message' && lineEvent.message.type === 'text') {
         const userInput = lineEvent.message.text;
         console.log("ユーザーの入力:", userInput);
@@ -63,8 +71,25 @@ const handler = async (event) => {
         // LINEのユーザーに返信
         await replyToLine(lineEvent.replyToken, response);
 
+        // ユーザー情報を取得
+        const userId = lineEvent.source.userId;
+        let userName = 'Unknown User';
+        try {
+          const profile = await lineClient.getProfile(userId);
+          userName = profile.displayName;
+        } catch (error) {
+          console.error('LINEの質問者情報の取得に失敗しました:', error);
+        }
+
         // Q&Aをスプレッドシートに記録
-        await recordToSpreadsheet(userInput, response);
+        try {
+          await recordToSpreadsheet(userInput, response, userName, userId);
+        } catch (error) {
+          console.error('スプレッドシートへの記録中にエラーが発生しました:', error);
+          if (error.response) {
+            console.error('エラーレスポンス:', JSON.stringify(error.response.data, null, 2));
+          }
+        }
       } else {
         console.log("処理対象外のイベントタイプです:", lineEvent.type);
       }
@@ -135,22 +160,44 @@ async function replyToLine(replyToken, message) {
   }
 }
 
-async function recordToSpreadsheet(question, answer) {
-  try {
-    const date = new Date().toISOString();
-    const values = [[date, question, answer]];
+async function recordToSpreadsheet(question, answer, userName, userId) {
+  if (!sheets) {
+    console.error('Google Sheets API が初期化されていません。環境変数を確認してください。');
+    return;
+  }
 
-    await sheets.spreadsheets.values.append({
+  try {
+    const date = toJapanTime(new Date());
+    const values = [[userName, userId, question, date, answer]];
+
+    const response = await sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'シート1',
+      range: 'シート1!A:E',
       valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
       resource: { values },
     });
 
-    console.log('記録をスプレッドシートに追加しました');
+    console.log('記録をスプレッドシートに追加しました', response.data);
   } catch (error) {
     console.error('スプレッドシートへの記録中にエラーが発生しました:', error);
+    if (error.response) {
+      console.error('エラーレスポンス:', error.response.data);
+    }
+    if (error.config) {
+      console.error('リクエスト設定:', {
+        url: error.config.url,
+        method: error.config.method,
+        data: error.config.data,
+      });
+    }
+    throw error;
   }
+}
+
+// 日本時間に変換する関数
+function toJapanTime(date) {
+  return new Date(date.getTime() + (9 * 60 * 60 * 1000)).toISOString().replace('T', ' ').substr(0, 19);
 }
 
 function verifySignature(body, channelSecret, signature) {
