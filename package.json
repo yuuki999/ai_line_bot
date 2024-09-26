@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.658.0",
+    "@aws-sdk/client-s3": "^3.658.0",
     "@line/bot-sdk": "^9.4.0",
     "@smithy/config-resolver": "^3.0.8",
     "@smithy/core": "^2.4.6",
@@ -33,6 +34,7 @@
     "mime-db": "^1.53.0",
     "mime-types": "^2.1.35",
     "node-fetch": "^3.3.2",
+    "pdfjs-dist": "^4.6.82",
     "proxy-from-env": "^1.1.0"
   },
   "devDependencies": {
