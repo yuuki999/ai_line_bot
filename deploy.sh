@@ -5,6 +5,7 @@ set -e
 # 関数名とリージョンを変数として定義
 FUNCTION_NAME="itoi_ai_bot"
 REGION="us-east-1"
+PROFILE="itoi"
 
 echo "Building the project..."
 pnpm build
@@ -18,7 +19,8 @@ echo "Deploying to Lambda..."
 aws lambda update-function-code \
   --function-name $FUNCTION_NAME \
   --zip-file fileb://function.zip \
-  --region $REGION
+  --region $REGION \
+  --profile $PROFILE
 
 echo "Deployment completed successfully!"
 

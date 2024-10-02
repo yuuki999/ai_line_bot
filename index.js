@@ -5,6 +5,7 @@ const axios = require('axios');
 const { google } = require('googleapis');
 const line = require('@line/bot-sdk');
 const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { Pinecone } = require('@pinecone-database/pinecone');
 
 // 環境変数の取得
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20240620-v1:0";
@@ -39,6 +40,11 @@ const lineClient = new line.Client(lineConfig);
 const bedrockClient = new BedrockRuntimeClient({ 
   region: "us-east-1",
 });
+
+// Pineconeクライアントの初期化
+// TODO: 将来的には、ログインユーザーごとのインデックスを参照できるようにする。
+const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+const index = pc.index('quickstart');
 
 // S3の初期化
 const s3Client = new S3Client({ region: "us-east-1" });
@@ -114,26 +120,32 @@ const handler = async (event) => {
 };
 
 async function sendToBedrock(userInput) {
-  const document = await loadDocument(); // S3から関連情報の取得
-  // documentが膨大になるとここで死ぬ。
-  // なのでMVPでもベクトルデータベースを利用する必要がある。
-  // でもめんどくさいな。5万文字くらいの情報でもここで回答速度、精度ともに問題なければこれでリリースしちゃうか。
-  // 検証する。
-  // あとはPDFをテキスト変換できるかどうかも検証する。
-  const prompt = `以下の情報を基に質問に答えてください。ただし、質問に関連する情報がない場合は、一般的な知識に基づいて回答してください。
+  // 1. Pineconeでベクトル検索を実行
+  const vectorSearchResults = await performVectorSearch(userInput);
 
-  参考情報:
-  ${document}
+  // 2. ベクトル検索結果からコンテキストを準備
+  // コンテキストが存在しても、関連性が低ければAIは理解できない。
+  const context = vectorSearchResults.length > 0 
+    ? prepareContext(vectorSearchResults)
+    : "関連する情報が見つかりませんでした。一般的な知識に基づいて回答します。";
+  console.log("ベクトルのコンテキスト", context);
+  
+  // 3. コンテキストを含むプロンプトを構築
+  const prompt = `以下のコンテキストとユーザーの質問に基づいて回答してください：
 
-  質問: ${userInput}
+コンテキスト：
+${context}
 
-  回答:`;
+ユーザーの質問： ${userInput}
 
+回答：`;
+
+  // 4. Bedrockにリクエストを送信
   const command = new InvokeModelCommand({
-    modelId: BEDROCK_MODEL_ID,
+    modelId: process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20240620-v1:0",
     body: JSON.stringify({
       anthropic_version: "bedrock-2023-05-31",
-      max_tokens: BEDROCK_MAX_TOKENS,
+      max_tokens: parseInt(process.env.BEDROCK_MAX_TOKENS || "1000", 10),
       messages: [
         { role: "user", content: prompt }
       ]
@@ -147,11 +159,73 @@ async function sendToBedrock(userInput) {
     if (responseBody.content && responseBody.content[0] && responseBody.content[0].text) {
       return responseBody.content[0].text;
     } else {
-      console.error("Unexpected response format from Bedrock:", responseBody);
-      throw new Error("Failed to generate response from Bedrock");
+      console.error("Bedrockからの予期せぬレスポンス形式:", responseBody);
+      throw new Error("Bedrockからの応答生成に失敗しました");
     }
   } catch (error) {
-    console.error("Error sending request to Bedrock:", error);
+    console.error("Bedrockへのリクエスト送信中にエラーが発生:", error);
+    throw error;
+  }
+}
+
+// ユーザーのテキストを元に、ベクトルデータを検索
+async function performVectorSearch(query, namespaceName = 'company_A', topK = 5, minScore = 0.05) {
+  try {
+    // クエリのエンベディングを生成
+    const queryEmbedding = await getBedrockEmbedding(query);
+    console.log('queryEmbedding:', queryEmbedding);
+
+    // 特定の名前空間のインデックスを取得(企業・グループごとに分ける仕組み)
+    const namespaceIndex = index.namespace(namespaceName);
+
+    // Pineconeでベクトル検索を実行
+    const searchResponse = await namespaceIndex.query({
+      vector: queryEmbedding,
+      topK: topK, // 類似している情報上位から何件取得するか
+      includeMetadata: true,
+      includeValues: false, // ベクトル値自体は必要ない場合はfalse
+    });
+
+    console.log('検索レスポンス:', JSON.stringify(searchResponse, null, 2));
+
+    // スコアでフィルタリング
+    const filteredMatches = searchResponse.matches.filter(match => match.score >= minScore);
+
+    if (filteredMatches.length === 0) {
+      console.log(`設定した類似度閾値（${minScore}）を超える検索結果が0件でした。クエリ: "${query}"`);
+    } else {
+      console.log(`${filteredMatches.length}件の結果が見つかりました。クエリ: "${query}"`);
+    }
+
+    return filteredMatches;
+  } catch (error) { 
+    console.error(`ベクトル検索中にエラーが発生しました: ${error.message}`);
+    throw error;
+  }
+}
+
+function prepareContext(vectorSearchResults) {
+  // ベクトル検索結果から関連情報を抽出してフォーマット
+  return vectorSearchResults.map(match => match.metadata.content).join('\n\n');
+}
+
+async function getBedrockEmbedding(text) {
+  const params = {
+    modelId: "amazon.titan-embed-text-v2:0",
+    contentType: "application/json",
+    accept: "application/json",
+    body: JSON.stringify({
+      inputText: text
+    }),
+  };
+
+  try {
+    const command = new InvokeModelCommand(params);
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+    return responseBody.embedding;
+  } catch (error) {
+    console.error("getBedrockEmbeddingでエラーが発生:", error);
     throw error;
   }
 }
